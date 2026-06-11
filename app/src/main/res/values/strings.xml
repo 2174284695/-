@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">路线模拟器</string>
+    <string name="simulation_channel_name">路线模拟</string>
+    <string name="simulation_channel_description">显示正在运行的模拟位置路线</string>
+    <string name="health_sync_label">同步模拟步数到 Health Connect</string>
+    <string name="health_sync_unavailable">健康数据同步不可用（需 Android 14+）</string>
+    <string name="health_rationale_title">健康数据权限说明</string>
+    <string name="health_rationale_text">开启健康数据同步后，路线模拟器会把本次路线根据移动距离估算出的模拟步数写入 Health Connect。记录会标明来源是本应用，不会读取你的其他健康数据，也不会伪装成硬件传感器数据。</string>
+    <string name="back">返回</string>
+</resources>
