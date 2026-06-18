@@ -25,6 +25,7 @@ import com.example.routesimulator.model.GeoMath;
 import com.example.routesimulator.model.RoutePoint;
 import com.example.routesimulator.model.RouteSample;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.time.Instant;
@@ -120,6 +121,9 @@ public final class SimulationService extends Service {
             stopSelf();
             return;
         }
+        if (routeStore.isRoundTripEnabled()) {
+            route = buildRoundTripRoute(route);
+        }
 
         float speedKmh = routeStore.loadSpeedKmh();
         int variationPercent = routeStore.loadVariationPercent();
@@ -213,6 +217,14 @@ public final class SimulationService extends Service {
         } else {
             handler.postDelayed(tickRunnable, TICK_MILLIS);
         }
+    }
+
+    private static List<RoutePoint> buildRoundTripRoute(List<RoutePoint> oneWayRoute) {
+        List<RoutePoint> roundTrip = new ArrayList<>(oneWayRoute);
+        for (int i = oneWayRoute.size() - 2; i >= 0; i--) {
+            roundTrip.add(oneWayRoute.get(i));
+        }
+        return roundTrip;
     }
 
     private void stopSimulation(String message) {

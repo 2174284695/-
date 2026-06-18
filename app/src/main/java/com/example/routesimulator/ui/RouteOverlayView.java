@@ -6,6 +6,8 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PointF;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.AttributeSet;
 import android.view.MotionEvent;
 import android.view.View;
@@ -32,20 +34,52 @@ public final class RouteOverlayView extends View {
         void onRouteChanged(List<RoutePoint> previousRoute);
     }
 
+    public interface OnWaypointEditListener {
+        void onWaypointMoved(int fromIndex, int toIndex);
+
+        void onWaypointDeleted(int index);
+    }
+
     private final Paint routeOutlinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint routePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint draftPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint failurePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint markerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint markerOutlinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint activePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint waypointPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint waypointOutlinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint waypointDragPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final List<PointF> draftPoints = new ArrayList<>();
+    private final Handler handler = new Handler(Looper.getMainLooper());
 
     private MapLibreMap map;
     private List<RoutePoint> route = Collections.emptyList();
+    private List<RoutePoint> waypoints = Collections.emptyList();
+    private List<RoutePoint> failedRoute = Collections.emptyList();
     private Mode mode = Mode.BROWSE;
     private RoutePoint activePoint;
     private OnRouteChangedListener routeChangedListener;
+    private OnWaypointEditListener waypointEditListener;
     private float minimumDraftSpacing;
+    private float touchSlop;
+    private int draggingWaypointIndex = -1;
+    private int pressedWaypointIndex = -1;
+    private boolean draggingWaypoint;
+    private boolean longPressHandled;
+    private float downX;
+    private float downY;
+    private final Runnable longPressRunnable = () -> {
+        if (mode == Mode.POINT
+                && pressedWaypointIndex >= 0
+                && !draggingWaypoint
+                && waypointEditListener != null) {
+            longPressHandled = true;
+            waypointEditListener.onWaypointDeleted(pressedWaypointIndex);
+            pressedWaypointIndex = -1;
+            performClick();
+        }
+    };
 
     public RouteOverlayView(Context context) {
         this(context, null);
@@ -55,6 +89,7 @@ public final class RouteOverlayView extends View {
         super(context, attrs);
         setWillNotDraw(false);
         minimumDraftSpacing = 8f * getResources().getDisplayMetrics().density;
+        touchSlop = 6f * getResources().getDisplayMetrics().density;
 
         routeOutlinePaint.setColor(Color.WHITE);
         routeOutlinePaint.setStrokeWidth(dp(9));
@@ -75,6 +110,13 @@ public final class RouteOverlayView extends View {
         draftPaint.setStrokeCap(Paint.Cap.ROUND);
         draftPaint.setStrokeJoin(Paint.Join.ROUND);
 
+        failurePaint.setColor(Color.rgb(210, 52, 48));
+        failurePaint.setAlpha(230);
+        failurePaint.setStrokeWidth(dp(6));
+        failurePaint.setStyle(Paint.Style.STROKE);
+        failurePaint.setStrokeCap(Paint.Cap.ROUND);
+        failurePaint.setStrokeJoin(Paint.Join.ROUND);
+
         markerPaint.setColor(Color.WHITE);
         markerPaint.setStyle(Paint.Style.FILL);
         markerOutlinePaint.setColor(Color.rgb(19, 122, 80));
@@ -83,6 +125,13 @@ public final class RouteOverlayView extends View {
 
         activePaint.setColor(Color.rgb(255, 138, 0));
         activePaint.setStyle(Paint.Style.FILL);
+        waypointPaint.setColor(Color.rgb(31, 92, 190));
+        waypointPaint.setStyle(Paint.Style.FILL);
+        waypointOutlinePaint.setColor(Color.WHITE);
+        waypointOutlinePaint.setStrokeWidth(dp(3));
+        waypointOutlinePaint.setStyle(Paint.Style.STROKE);
+        waypointDragPaint.setColor(Color.rgb(255, 138, 0));
+        waypointDragPaint.setStyle(Paint.Style.FILL);
         setMode(Mode.BROWSE);
     }
 
@@ -98,11 +147,22 @@ public final class RouteOverlayView extends View {
         invalidate();
     }
 
+    public void setWaypoints(List<RoutePoint> waypoints) {
+        this.waypoints = waypoints;
+        invalidate();
+    }
+
+    public void setFailedRoute(List<RoutePoint> failedRoute) {
+        this.failedRoute = failedRoute == null ? Collections.emptyList() : failedRoute;
+        invalidate();
+    }
+
     public void setMode(Mode mode) {
         this.mode = mode;
-        boolean drawsDirectly = mode == Mode.DRAW;
-        setClickable(drawsDirectly);
-        setFocusable(drawsDirectly);
+        boolean handlesTouches = mode == Mode.DRAW || mode == Mode.POINT;
+        setClickable(handlesTouches);
+        setFocusable(handlesTouches);
+        resetWaypointGesture();
         draftPoints.clear();
         invalidate();
     }
@@ -120,6 +180,10 @@ public final class RouteOverlayView extends View {
         routeChangedListener = listener;
     }
 
+    public void setOnWaypointEditListener(OnWaypointEditListener listener) {
+        waypointEditListener = listener;
+    }
+
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
@@ -127,13 +191,21 @@ public final class RouteOverlayView extends View {
             return;
         }
         drawRoute(canvas);
+        drawFailedRoute(canvas);
+        drawWaypoints(canvas);
         drawDraft(canvas);
         drawActivePoint(canvas);
     }
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        if (mode != Mode.DRAW || map == null) {
+        if (map == null) {
+            return false;
+        }
+        if (mode == Mode.POINT) {
+            return handleWaypointTouch(event);
+        }
+        if (mode != Mode.DRAW) {
             return false;
         }
 
@@ -155,6 +227,7 @@ public final class RouteOverlayView extends View {
                 return true;
             case MotionEvent.ACTION_CANCEL:
                 draftPoints.clear();
+                resetWaypointGesture();
                 invalidate();
                 return true;
             default:
@@ -206,6 +279,22 @@ public final class RouteOverlayView extends View {
         canvas.drawPath(path, draftPaint);
     }
 
+    private void drawFailedRoute(Canvas canvas) {
+        if (failedRoute.size() < 2) {
+            return;
+        }
+        Path path = new Path();
+        for (int i = 0; i < failedRoute.size(); i++) {
+            PointF screenPoint = toScreenPoint(failedRoute.get(i));
+            if (i == 0) {
+                path.moveTo(screenPoint.x, screenPoint.y);
+            } else {
+                path.lineTo(screenPoint.x, screenPoint.y);
+            }
+        }
+        canvas.drawPath(path, failurePaint);
+    }
+
     private void drawActivePoint(Canvas canvas) {
         if (activePoint == null) {
             return;
@@ -213,6 +302,20 @@ public final class RouteOverlayView extends View {
         PointF point = toScreenPoint(activePoint);
         canvas.drawCircle(point.x, point.y, dp(10), markerPaint);
         canvas.drawCircle(point.x, point.y, dp(7), activePaint);
+    }
+
+    private void drawWaypoints(Canvas canvas) {
+        for (int i = 0; i < waypoints.size(); i++) {
+            RoutePoint waypoint = waypoints.get(i);
+            PointF point = toScreenPoint(waypoint);
+            canvas.drawCircle(point.x, point.y, dp(9), waypointOutlinePaint);
+            canvas.drawCircle(
+                    point.x,
+                    point.y,
+                    i == draggingWaypointIndex ? dp(7) : dp(6),
+                    i == draggingWaypointIndex ? waypointDragPaint : waypointPaint
+            );
+        }
     }
 
     private void drawMarker(Canvas canvas, PointF point, int color) {
@@ -236,6 +339,102 @@ public final class RouteOverlayView extends View {
         if (Math.hypot(point.x - previous.x, point.y - previous.y) >= minimumDraftSpacing) {
             draftPoints.add(point);
         }
+    }
+
+    private boolean handleWaypointTouch(MotionEvent event) {
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                pressedWaypointIndex = findWaypointAt(event.getX(), event.getY());
+                if (pressedWaypointIndex < 0) {
+                    return false;
+                }
+                draggingWaypointIndex = pressedWaypointIndex;
+                draggingWaypoint = false;
+                longPressHandled = false;
+                downX = event.getX();
+                downY = event.getY();
+                handler.postDelayed(longPressRunnable, 550L);
+                invalidate();
+                return true;
+            case MotionEvent.ACTION_MOVE:
+                if (pressedWaypointIndex < 0) {
+                    return false;
+                }
+                float dx = event.getX() - downX;
+                float dy = event.getY() - downY;
+                if (!draggingWaypoint && Math.hypot(dx, dy) > touchSlop) {
+                    draggingWaypoint = true;
+                    handler.removeCallbacks(longPressRunnable);
+                }
+                if (draggingWaypoint) {
+                    int targetIndex = findNearestWaypoint(event.getX(), event.getY());
+                    if (targetIndex >= 0) {
+                        draggingWaypointIndex = targetIndex;
+                        invalidate();
+                    }
+                }
+                return true;
+            case MotionEvent.ACTION_UP:
+                handler.removeCallbacks(longPressRunnable);
+                if (pressedWaypointIndex >= 0 && draggingWaypoint && !longPressHandled) {
+                    int targetIndex = findNearestWaypoint(event.getX(), event.getY());
+                    if (targetIndex >= 0
+                            && targetIndex != pressedWaypointIndex
+                            && waypointEditListener != null) {
+                        waypointEditListener.onWaypointMoved(pressedWaypointIndex, targetIndex);
+                    }
+                    performClick();
+                }
+                resetWaypointGesture();
+                invalidate();
+                return true;
+            case MotionEvent.ACTION_CANCEL:
+                resetWaypointGesture();
+                invalidate();
+                return true;
+            default:
+                return true;
+        }
+    }
+
+    private int findWaypointAt(float x, float y) {
+        float radius = dp(18);
+        int bestIndex = -1;
+        double bestDistance = Double.MAX_VALUE;
+        for (int i = 0; i < waypoints.size(); i++) {
+            PointF point = toScreenPoint(waypoints.get(i));
+            double distance = Math.hypot(point.x - x, point.y - y);
+            if (distance <= radius && distance < bestDistance) {
+                bestIndex = i;
+                bestDistance = distance;
+            }
+        }
+        return bestIndex;
+    }
+
+    private int findNearestWaypoint(float x, float y) {
+        if (waypoints.isEmpty()) {
+            return -1;
+        }
+        int bestIndex = 0;
+        double bestDistance = Double.MAX_VALUE;
+        for (int i = 0; i < waypoints.size(); i++) {
+            PointF point = toScreenPoint(waypoints.get(i));
+            double distance = Math.hypot(point.x - x, point.y - y);
+            if (distance < bestDistance) {
+                bestIndex = i;
+                bestDistance = distance;
+            }
+        }
+        return bestIndex;
+    }
+
+    private void resetWaypointGesture() {
+        handler.removeCallbacks(longPressRunnable);
+        pressedWaypointIndex = -1;
+        draggingWaypointIndex = -1;
+        draggingWaypoint = false;
+        longPressHandled = false;
     }
 
     private void commitDraft() {

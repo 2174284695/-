@@ -17,10 +17,12 @@ import java.util.UUID;
 public final class RouteStore {
     private static final String PREFS = "route_simulator";
     private static final String KEY_ROUTE = "route";
+    private static final String KEY_WAYPOINTS = "waypoints";
     private static final String KEY_SPEED = "speed_kmh";
     private static final String KEY_VARIATION = "variation_percent";
     private static final String KEY_RUNNING = "simulation_running";
     private static final String KEY_HEALTH_SYNC = "health_sync";
+    private static final String KEY_ROUND_TRIP = "round_trip";
     private static final String KEY_SAVED_ROUTES = "saved_routes";
 
     private final SharedPreferences preferences;
@@ -30,6 +32,22 @@ public final class RouteStore {
     }
 
     public void saveRoute(List<RoutePoint> points) {
+        savePoints(KEY_ROUTE, points);
+    }
+
+    public List<RoutePoint> loadRoute() {
+        return loadPoints(KEY_ROUTE);
+    }
+
+    public void saveWaypoints(List<RoutePoint> points) {
+        savePoints(KEY_WAYPOINTS, points);
+    }
+
+    public List<RoutePoint> loadWaypoints() {
+        return loadPoints(KEY_WAYPOINTS);
+    }
+
+    private void savePoints(String key, List<RoutePoint> points) {
         JSONArray array = new JSONArray();
         for (RoutePoint point : points) {
             try {
@@ -38,19 +56,19 @@ public final class RouteStore {
                 // Latitude and longitude are finite values produced by the map.
             }
         }
-        preferences.edit().putString(KEY_ROUTE, array.toString()).apply();
+        preferences.edit().putString(key, array.toString()).apply();
     }
 
-    public List<RoutePoint> loadRoute() {
+    private List<RoutePoint> loadPoints(String key) {
         List<RoutePoint> points = new ArrayList<>();
-        String encoded = preferences.getString(KEY_ROUTE, "[]");
+        String encoded = preferences.getString(key, "[]");
         try {
             JSONArray array = new JSONArray(encoded);
             for (int i = 0; i < array.length(); i++) {
                 points.add(RoutePoint.fromJson(array.getJSONObject(i)));
             }
         } catch (JSONException ignored) {
-            preferences.edit().remove(KEY_ROUTE).apply();
+            preferences.edit().remove(key).apply();
         }
         return points;
     }
@@ -84,6 +102,14 @@ public final class RouteStore {
 
     public boolean isHealthSyncEnabled() {
         return preferences.getBoolean(KEY_HEALTH_SYNC, false);
+    }
+
+    public void setRoundTripEnabled(boolean enabled) {
+        preferences.edit().putBoolean(KEY_ROUND_TRIP, enabled).apply();
+    }
+
+    public boolean isRoundTripEnabled() {
+        return preferences.getBoolean(KEY_ROUND_TRIP, false);
     }
 
     public SavedRoute saveNamedRoute(String requestedName, List<RoutePoint> points) {
