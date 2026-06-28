@@ -13,6 +13,7 @@ public final class SavedRoute {
     private final String name;
     private final long updatedAtMillis;
     private final List<RoutePoint> points;
+    private final List<RouteWaypoint> waypoints;
 
     public SavedRoute(
             String id,
@@ -20,10 +21,21 @@ public final class SavedRoute {
             long updatedAtMillis,
             List<RoutePoint> points
     ) {
+        this(id, name, updatedAtMillis, points, Collections.emptyList());
+    }
+
+    public SavedRoute(
+            String id,
+            String name,
+            long updatedAtMillis,
+            List<RoutePoint> points,
+            List<RouteWaypoint> waypoints
+    ) {
         this.id = id;
         this.name = name;
         this.updatedAtMillis = updatedAtMillis;
         this.points = Collections.unmodifiableList(new ArrayList<>(points));
+        this.waypoints = Collections.unmodifiableList(new ArrayList<>(waypoints));
     }
 
     public String id() {
@@ -42,6 +54,10 @@ public final class SavedRoute {
         return points;
     }
 
+    public List<RouteWaypoint> waypoints() {
+        return waypoints;
+    }
+
     public double distanceMeters() {
         return GeoMath.totalDistanceMeters(points);
     }
@@ -56,6 +72,11 @@ public final class SavedRoute {
             encodedPoints.put(point.toJson());
         }
         json.put("points", encodedPoints);
+        JSONArray encodedWaypoints = new JSONArray();
+        for (RouteWaypoint waypoint : waypoints) {
+            encodedWaypoints.put(waypoint.toJson());
+        }
+        json.put("waypoints", encodedWaypoints);
         return json;
     }
 
@@ -65,11 +86,19 @@ public final class SavedRoute {
         for (int i = 0; i < encodedPoints.length(); i++) {
             points.add(RoutePoint.fromJson(encodedPoints.getJSONObject(i)));
         }
+        List<RouteWaypoint> waypoints = new ArrayList<>();
+        JSONArray encodedWaypoints = json.optJSONArray("waypoints");
+        if (encodedWaypoints != null) {
+            for (int i = 0; i < encodedWaypoints.length(); i++) {
+                waypoints.add(RouteWaypoint.fromJson(encodedWaypoints.getJSONObject(i)));
+            }
+        }
         return new SavedRoute(
                 json.getString("id"),
                 json.getString("name"),
                 json.getLong("updatedAt"),
-                points
+                points,
+                waypoints
         );
     }
 }

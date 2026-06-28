@@ -17,7 +17,12 @@ public final class HumanSpeedModel {
     }
 
     public double nextSpeed(double deltaSeconds) {
+        return nextSpeed(deltaSeconds, 1.0);
+    }
+
+    public double nextSpeed(double deltaSeconds, double routeFactor) {
         double dt = Math.max(0.05, Math.min(2.0, deltaSeconds));
+        double factor = clamp(routeFactor, 0.35, 1.18);
 
         // Mean-reverting random drift gives gradual, natural-looking variation.
         double reversion = 0.45;
@@ -25,13 +30,13 @@ public final class HumanSpeedModel {
         drift += -reversion * drift * dt + noise * Math.sqrt(dt) * random.nextGaussian();
         drift = clamp(drift, -variationFraction, variationFraction);
 
-        double desired = baseSpeedMetersPerSecond * (1.0 + drift);
+        double desired = baseSpeedMetersPerSecond * (1.0 + drift) * factor;
         double maxAcceleration = Math.max(0.18, baseSpeedMetersPerSecond * 0.12);
         double maximumChange = maxAcceleration * dt;
         currentSpeed += clamp(desired - currentSpeed, -maximumChange, maximumChange);
 
-        double minimum = baseSpeedMetersPerSecond * (1.0 - variationFraction);
-        double maximum = baseSpeedMetersPerSecond * (1.0 + variationFraction);
+        double minimum = baseSpeedMetersPerSecond * factor * (1.0 - variationFraction);
+        double maximum = baseSpeedMetersPerSecond * factor * (1.0 + variationFraction);
         return clamp(currentSpeed, minimum, maximum);
     }
 

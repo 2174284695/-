@@ -1,7 +1,10 @@
 package com.example.routesimulator.routing;
 
+import com.example.routesimulator.model.GeoMath;
 import com.example.routesimulator.model.RoutePoint;
+import com.example.routesimulator.model.RouteWaypoint;
 import com.example.routesimulator.model.RouteSimplifier;
+import com.example.routesimulator.model.WaypointType;
 
 import android.util.Log;
 
@@ -18,6 +21,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 
@@ -28,6 +32,8 @@ public final class RoadRouteClient {
     private static final int MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
     private static final int CONNECT_TIMEOUT_MILLIS = 10_000;
     private static final int READ_TIMEOUT_MILLIS = 20_000;
+    private static final double AUTO_FORCE_THRESHOLD_METERS = 10.0;
+    private static final double EXACT_ANCHOR_THRESHOLD_METERS = 1.0;
     private static final String VALHALLA_ENDPOINT =
             "https://valhalla1.openstreetmap.de/route";
     private static final String USER_AGENT =
@@ -48,13 +54,52 @@ public final class RoadRouteClient {
         }
     }
 
+    public static final class HybridRouteResult {
+        private final List<RoutePoint> route;
+        private final List<RouteWaypoint> waypoints;
+
+        private HybridRouteResult(List<RoutePoint> route, List<RouteWaypoint> waypoints) {
+            this.route = Collections.unmodifiableList(new ArrayList<>(route));
+            this.waypoints = Collections.unmodifiableList(new ArrayList<>(waypoints));
+        }
+
+        public List<RoutePoint> route() {
+            return route;
+        }
+
+        public List<RouteWaypoint> waypoints() {
+            return waypoints;
+        }
+    }
+
     public List<RoutePoint> route(List<RoutePoint> original, Profile profile)
             throws IOException {
         List<RoutePoint> waypoints = selectWaypoints(original, MAX_WAYPOINTS);
         if (waypoints.size() < 2) {
             throw new IllegalArgumentException("至少需要两个路线点");
         }
+        return requestRoadRoute(waypoints, profile);
+    }
 
+    public HybridRouteResult routeWaypoints(
+            List<RouteWaypoint> requestedWaypoints,
+            Profile profile
+    ) throws IOException {
+        if (requestedWaypoints.size() < 2) {
+            throw new IllegalArgumentException("至少需要两个途经点");
+        }
+        if (requestedWaypoints.size() > MAX_WAYPOINTS) {
+            throw new IllegalArgumentException("最多支持 25 个途经点");
+        }
+        List<RoutePoint> requestedPoints = RouteWaypoint.pointsOf(requestedWaypoints);
+        List<RoutePoint> roadRoute = requestRoadRoute(requestedPoints, profile);
+        return buildHybridRoute(roadRoute, requestedWaypoints);
+    }
+
+    private List<RoutePoint> requestRoadRoute(
+            List<RoutePoint> waypoints,
+            Profile profile
+    ) throws IOException {
         String osrmError;
         try {
             Log.i(TAG, "routing with OSRM, profile=" + profile
@@ -119,6 +164,52 @@ public final class RoadRouteClient {
             points.add(new RoutePoint(latitude / 1_000_000.0, longitude / 1_000_000.0));
         }
         return points;
+    }
+
+    static HybridRouteResult buildHybridRoute(
+            List<RoutePoint> roadRoute,
+            List<RouteWaypoint> requestedWaypoints
+    ) {
+        if (roadRoute.size() < 2 || requestedWaypoints.isEmpty()) {
+            return new HybridRouteResult(roadRoute, requestedWaypoints);
+        }
+
+        List<RoutePoint> hybridRoute = new ArrayList<>(roadRoute);
+        List<RouteWaypoint> resolvedWaypoints = new ArrayList<>(requestedWaypoints.size());
+        int searchStart = 0;
+        for (int i = 0; i < requestedWaypoints.size(); i++) {
+            RouteWaypoint requested = requestedWaypoints.get(i);
+            RoutePoint requestedPoint = requested.point();
+            NearestRoutePosition nearest = findNearestRoutePosition(
+                    hybridRoute,
+                    requestedPoint,
+                    searchStart
+            );
+            boolean shouldForce = requested.type() == WaypointType.FORCED
+                    || (!requested.isManualType()
+                    && nearest.distanceMeters > AUTO_FORCE_THRESHOLD_METERS);
+            RouteWaypoint resolved = shouldForce
+                    ? requested.withResolvedType(WaypointType.FORCED)
+                    : requested.withResolvedType(WaypointType.ROAD);
+            resolvedWaypoints.add(resolved);
+
+            if (!shouldForce || nearest.distanceMeters <= EXACT_ANCHOR_THRESHOLD_METERS) {
+                searchStart = nearest.nextSearchIndex;
+                continue;
+            }
+
+            int insertIndex;
+            if (i == 0) {
+                insertIndex = 0;
+            } else if (i == requestedWaypoints.size() - 1) {
+                insertIndex = hybridRoute.size();
+            } else {
+                insertIndex = Math.min(nearest.insertIndex, hybridRoute.size());
+            }
+            hybridRoute.add(insertIndex, requestedPoint);
+            searchStart = Math.min(insertIndex + 1, hybridRoute.size() - 1);
+        }
+        return new HybridRouteResult(hybridRoute, resolvedWaypoints);
     }
 
     private List<RoutePoint> requestOsrmInBatches(
@@ -311,6 +402,59 @@ public final class RoadRouteClient {
         destination.addAll(source.subList(start, source.size()));
     }
 
+    private static NearestRoutePosition findNearestRoutePosition(
+            List<RoutePoint> route,
+            RoutePoint target,
+            int searchStart
+    ) {
+        int start = Math.max(0, Math.min(searchStart, route.size() - 1));
+        if (route.size() < 2 || start >= route.size() - 1) {
+            return new NearestRoutePosition(
+                    Math.min(start + 1, route.size()),
+                    start,
+                    GeoMath.distanceMeters(route.get(start), target)
+            );
+        }
+
+        int bestSegmentStart = start;
+        double bestDistance = Double.MAX_VALUE;
+        for (int i = start; i < route.size() - 1; i++) {
+            double distance = distanceToSegmentMeters(route.get(i), route.get(i + 1), target);
+            if (distance < bestDistance) {
+                bestSegmentStart = i;
+                bestDistance = distance;
+            }
+        }
+        return new NearestRoutePosition(bestSegmentStart + 1, bestSegmentStart, bestDistance);
+    }
+
+    private static double distanceToSegmentMeters(
+            RoutePoint start,
+            RoutePoint end,
+            RoutePoint target
+    ) {
+        double latitudeScale = 111_320.0;
+        double longitudeScale = latitudeScale * Math.cos(Math.toRadians(target.latitude()));
+
+        double startX = (start.longitude() - target.longitude()) * longitudeScale;
+        double startY = (start.latitude() - target.latitude()) * latitudeScale;
+        double endX = (end.longitude() - target.longitude()) * longitudeScale;
+        double endY = (end.latitude() - target.latitude()) * latitudeScale;
+
+        double segmentX = endX - startX;
+        double segmentY = endY - startY;
+        double lengthSquared = segmentX * segmentX + segmentY * segmentY;
+        if (lengthSquared <= 0.001) {
+            return Math.hypot(startX, startY);
+        }
+
+        double fraction = -(startX * segmentX + startY * segmentY) / lengthSquared;
+        double clamped = Math.max(0.0, Math.min(1.0, fraction));
+        double closestX = startX + clamped * segmentX;
+        double closestY = startY + clamped * segmentY;
+        return Math.hypot(closestX, closestY);
+    }
+
     private static String readResponse(InputStream inputStream) throws IOException {
         try (BufferedInputStream input = new BufferedInputStream(inputStream);
              ByteArrayOutputStream output = new ByteArrayOutputStream()) {
@@ -338,5 +482,21 @@ public final class RoadRouteClient {
     private static String shorten(String value) {
         String compact = value.replace('\n', ' ').trim();
         return compact.length() <= 180 ? compact : compact.substring(0, 180) + "…";
+    }
+
+    private static final class NearestRoutePosition {
+        private final int insertIndex;
+        private final int nextSearchIndex;
+        private final double distanceMeters;
+
+        private NearestRoutePosition(
+                int insertIndex,
+                int nextSearchIndex,
+                double distanceMeters
+        ) {
+            this.insertIndex = insertIndex;
+            this.nextSearchIndex = nextSearchIndex;
+            this.distanceMeters = distanceMeters;
+        }
     }
 }

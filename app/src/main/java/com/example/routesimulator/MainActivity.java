@@ -40,7 +40,9 @@ import android.widget.Toast;
 import com.example.routesimulator.data.RouteStore;
 import com.example.routesimulator.model.GeoMath;
 import com.example.routesimulator.model.RoutePoint;
+import com.example.routesimulator.model.RouteWaypoint;
 import com.example.routesimulator.model.SavedRoute;
+import com.example.routesimulator.model.WaypointType;
 import com.example.routesimulator.routing.RoadRouteClient;
 import com.example.routesimulator.simulation.MockLocationAccess;
 import com.example.routesimulator.simulation.SimulatedStepModel;
@@ -94,7 +96,7 @@ public final class MainActivity extends ComponentActivity {
             DateTimeFormatter.ofPattern("MM-dd HH:mm", Locale.CHINA);
 
     private final List<RoutePoint> route = new ArrayList<>();
-    private final List<RoutePoint> waypoints = new ArrayList<>();
+    private final List<RouteWaypoint> waypoints = new ArrayList<>();
     private final Deque<List<RoutePoint>> history = new ArrayDeque<>();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService routingExecutor = Executors.newSingleThreadExecutor();
@@ -105,6 +107,7 @@ public final class MainActivity extends ComponentActivity {
     private MapLibreMap map;
     private RouteOverlayView routeOverlay;
     private TextView statusText;
+    private TextView routeStateText;
     private TextView modeHintText;
     private TextView routeStatsText;
     private TextView speedValueText;
@@ -120,14 +123,20 @@ public final class MainActivity extends ComponentActivity {
     private Button routeLibraryButton;
     private Button roadSnapButton;
     private Button routePlanButton;
+    private Button waypointOrderButton;
+    private Button currentStartButton;
+    private Button reverseRouteButton;
+    private Button moreToolsButton;
     private CheckBox roundTripCheckBox;
     private Button startButton;
     private SeekBar speedSeekBar;
     private SeekBar variationSeekBar;
     private CheckBox healthSyncCheckBox;
     private LinearLayout controlPanelContent;
+    private LinearLayout moreToolsContent;
     private Button panelToggleButton;
     private boolean controlPanelCollapsed;
+    private boolean moreToolsExpanded;
     private boolean mapReady;
     private boolean simulationRunning;
     private boolean pendingStartAfterPermission;
@@ -137,7 +146,9 @@ public final class MainActivity extends ComponentActivity {
     private boolean roadSnapInProgress;
     private String currentSavedRouteName;
     private boolean pendingLocateAfterPermission;
+    private boolean pendingSetStartAfterPermission;
     private boolean locationRequestInProgress;
+    private boolean locationRequestForStartPoint;
     private CancellationSignal locationCancellationSignal;
     private LocationListener legacyLocationListener;
     private Location locationFallback;
@@ -150,9 +161,10 @@ public final class MainActivity extends ComponentActivity {
         cancelLocationRequest();
         locationFallback = null;
         if (fallback != null) {
-            showLocationOnMap(fallback);
+            handleLocationResult(fallback, true);
             Toast.makeText(this, "已定位到系统记录的最近位置", Toast.LENGTH_SHORT).show();
         } else {
+            locationRequestForStartPoint = false;
             Toast.makeText(
                     this,
                     "暂时无法获取当前位置，请检查系统定位信号",
@@ -224,6 +236,7 @@ public final class MainActivity extends ComponentActivity {
                         progress,
                         total
                 ));
+                updateRouteStateText(total);
             } else {
                 updateRouteStats();
                 if (message != null && !message.isEmpty()) {
@@ -319,11 +332,16 @@ public final class MainActivity extends ComponentActivity {
                 == PackageManager.PERMISSION_GRANTED;
         if (granted) {
             boolean shouldLocate = pendingLocateAfterPermission;
+            boolean shouldSetStart = pendingSetStartAfterPermission;
             boolean shouldStart = pendingStartAfterPermission;
             pendingLocateAfterPermission = false;
+            pendingSetStartAfterPermission = false;
             pendingStartAfterPermission = false;
             if (shouldLocate) {
                 centerOnCurrentLocation();
+            }
+            if (shouldSetStart) {
+                setCurrentLocationAsRouteStart();
             }
             if (shouldStart) {
                 startSimulation();
@@ -331,11 +349,13 @@ public final class MainActivity extends ComponentActivity {
             return;
         }
         boolean locateWasPending = pendingLocateAfterPermission;
+        boolean setStartWasPending = pendingSetStartAfterPermission;
         pendingLocateAfterPermission = false;
+        pendingSetStartAfterPermission = false;
         pendingStartAfterPermission = false;
         Toast.makeText(
                 this,
-                locateWasPending
+                locateWasPending || setStartWasPending
                         ? "需要精确位置权限才能定位当前位置"
                         : "需要精确位置权限才能运行前台模拟服务",
                 Toast.LENGTH_LONG
@@ -364,6 +384,22 @@ public final class MainActivity extends ComponentActivity {
             pushHistory(previousRoute);
             waypoints.clear();
             onRouteEdited();
+        });
+        routeOverlay.setOnWaypointEditListener(new RouteOverlayView.OnWaypointEditListener() {
+            @Override
+            public void onWaypointMoved(int fromIndex, int toIndex) {
+                moveWaypoint(fromIndex, toIndex);
+            }
+
+            @Override
+            public void onWaypointDeleted(int index) {
+                deleteWaypoint(index);
+            }
+
+            @Override
+            public void onWaypointLongPressed(int index) {
+                showWaypointEditDialog(index);
+            }
         });
         root.addView(routeOverlay, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -547,75 +583,71 @@ public final class MainActivity extends ComponentActivity {
     private View buildControlPanel() {
         LinearLayout panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(dp(16), dp(14), dp(16), dp(14));
+        panel.setPadding(dp(14), dp(10), dp(14), dp(10));
         panel.setBackgroundResource(R.drawable.bg_panel);
         panel.setElevation(dp(8));
 
         LinearLayout header = horizontalRow();
-        TextView title = textView("绘制路线", 19, R.color.ink);
+        TextView title = textView("路线控制", 18, R.color.ink);
         title.setTypeface(title.getTypeface(), android.graphics.Typeface.BOLD);
         header.addView(title);
         header.addView(weightedSpace());
         panelToggleButton = secondaryButton("收起");
         panelToggleButton.setOnClickListener(view -> setControlPanelCollapsed(!controlPanelCollapsed));
-        header.addView(panelToggleButton, new LinearLayout.LayoutParams(dp(86), dp(38)));
+        header.addView(panelToggleButton, new LinearLayout.LayoutParams(dp(78), dp(34)));
         panel.addView(header);
 
+        LimitedHeightScrollView contentScroll = new LimitedHeightScrollView(this, 0.46f);
+        contentScroll.setFillViewport(false);
+        contentScroll.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS);
+        contentScroll.setVerticalScrollBarEnabled(false);
         controlPanelContent = new LinearLayout(this);
         controlPanelContent.setOrientation(LinearLayout.VERTICAL);
-        panel.addView(controlPanelContent);
+        contentScroll.addView(controlPanelContent, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+        panel.addView(contentScroll, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
 
-        LinearLayout modeRow = horizontalRow();
-        browseButton = secondaryButton("浏览");
-        pointButton = secondaryButton("点选");
-        drawButton = secondaryButton("手绘");
-        browseButton.setOnClickListener(view -> setMode(RouteOverlayView.Mode.BROWSE));
-        pointButton.setOnClickListener(view -> setMode(RouteOverlayView.Mode.POINT));
-        drawButton.setOnClickListener(view -> setMode(RouteOverlayView.Mode.DRAW));
-        addEqualButtons(modeRow, browseButton, pointButton, drawButton);
-        controlPanelContent.addView(modeRow, marginTopParams(dp(8)));
-
-        modeHintText = textView("", 13, R.color.muted);
-        controlPanelContent.addView(modeHintText, marginTopParams(dp(5)));
+        routeStateText = textView("", 14, R.color.ink);
+        routeStateText.setBackgroundResource(R.drawable.bg_status_ok);
+        routeStateText.setPadding(dp(10), dp(7), dp(10), dp(7));
+        controlPanelContent.addView(routeStateText, marginTopParams(dp(6)));
 
         routeStatsText = textView("", 14, R.color.ink);
         routeStatsText.setTypeface(
                 routeStatsText.getTypeface(),
                 android.graphics.Typeface.BOLD
         );
-        controlPanelContent.addView(routeStatsText, marginTopParams(dp(8)));
+        controlPanelContent.addView(routeStatsText, marginTopParams(dp(6)));
 
-        LinearLayout editRow = horizontalRow();
-        undoButton = secondaryButton("撤销");
-        clearButton = secondaryButton("清空");
-        fitButton = secondaryButton("显示全程");
-        undoButton.setOnClickListener(view -> undoEdit());
-        clearButton.setOnClickListener(view -> clearRoute());
-        fitButton.setOnClickListener(view -> fitRoute());
-        addEqualButtons(editRow, undoButton, clearButton, fitButton);
-        controlPanelContent.addView(editRow, marginTopParams(dp(8)));
+        controlPanelContent.addView(sectionLabel("编辑方式"), marginTopParams(dp(8)));
+        LinearLayout modeRow = horizontalRow();
+        browseButton = secondaryButton("浏览");
+        pointButton = secondaryButton("点选");
+        drawButton = secondaryButton("手绘");
+        currentStartButton = secondaryButton("定位设起点");
+        browseButton.setOnClickListener(view -> setMode(RouteOverlayView.Mode.BROWSE));
+        pointButton.setOnClickListener(view -> setMode(RouteOverlayView.Mode.POINT));
+        drawButton.setOnClickListener(view -> setMode(RouteOverlayView.Mode.DRAW));
+        currentStartButton.setOnClickListener(view -> setCurrentLocationAsRouteStart());
+        addEqualButtons(
+                modeRow,
+                currentStartButton,
+                pointButton,
+                drawButton,
+                browseButton
+        );
+        controlPanelContent.addView(modeRow, marginTopParams(dp(4)));
 
-        LinearLayout savedRouteRow = horizontalRow();
-        saveRouteButton = secondaryButton("保存路线");
-        routeLibraryButton = secondaryButton("路线库");
-        saveRouteButton.setOnClickListener(view -> showSaveRouteDialog());
-        routeLibraryButton.setOnClickListener(view -> showRouteLibraryDialog());
-        addEqualButtons(savedRouteRow, saveRouteButton, routeLibraryButton);
-        controlPanelContent.addView(savedRouteRow, marginTopParams(dp(7)));
-
-        LinearLayout snapRow = horizontalRow();
-        roadSnapButton = secondaryButton("道路吸附");
-        routePlanButton = secondaryButton("多点规划");
-        roadSnapButton.setOnClickListener(view -> requestHandDrawnRoadRoute(
-                RoadRouteClient.Profile.FOOT,
-                "路线已按步行道路吸附"
-        ));
-        routePlanButton.setOnClickListener(view -> planWalkingRoute());
-        addEqualButtons(snapRow, roadSnapButton, routePlanButton);
-        controlPanelContent.addView(snapRow, marginTopParams(dp(7)));
+        modeHintText = textView("", 13, R.color.muted);
+        controlPanelContent.addView(modeHintText, marginTopParams(dp(4)));
 
         roundTripCheckBox = new CheckBox(this);
-        roundTripCheckBox.setText("往返路线：到达终点后按原路返回");
+        roundTripCheckBox.setText("路线模式：往返（到达终点后按原路返回）");
         roundTripCheckBox.setTextSize(13);
         roundTripCheckBox.setTextColor(getColor(R.color.ink));
         roundTripCheckBox.setMinHeight(0);
@@ -631,7 +663,7 @@ public final class MainActivity extends ComponentActivity {
         speedHeader.addView(weightedSpace());
         speedValueText = textView("", 14, R.color.primary);
         speedHeader.addView(speedValueText);
-        controlPanelContent.addView(speedHeader, marginTopParams(dp(10)));
+        controlPanelContent.addView(speedHeader, marginTopParams(dp(7)));
 
         speedSeekBar = new SeekBar(this);
         speedSeekBar.setMax(290);
@@ -646,12 +678,76 @@ public final class MainActivity extends ComponentActivity {
         });
         controlPanelContent.addView(speedSeekBar, compactSeekBarParams());
 
+        controlPanelContent.addView(sectionLabel("主动作"), marginTopParams(dp(6)));
+        startButton = new Button(this);
+        startButton.setText("开始模拟");
+        startButton.setTextColor(Color.WHITE);
+        startButton.setTextSize(16);
+        startButton.setAllCaps(false);
+        startButton.setBackgroundResource(R.drawable.bg_button_primary);
+        startButton.setOnClickListener(view -> {
+            if (simulationRunning) {
+                stopSimulation();
+            } else {
+                validateAndStart();
+            }
+        });
+        LinearLayout.LayoutParams startParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(46)
+        );
+        startParams.topMargin = dp(3);
+        controlPanelContent.addView(startButton, startParams);
+
+        LinearLayout actionRow = horizontalRow();
+        routePlanButton = secondaryButton("多点规划");
+        routeLibraryButton = secondaryButton("路线库");
+        moreToolsButton = secondaryButton("更多工具");
+        routePlanButton.setOnClickListener(view -> planWalkingRoute());
+        routeLibraryButton.setOnClickListener(view -> showRouteLibraryDialog());
+        moreToolsButton.setOnClickListener(view -> setMoreToolsExpanded(!moreToolsExpanded));
+        addEqualButtons(actionRow, routePlanButton, routeLibraryButton, moreToolsButton);
+        controlPanelContent.addView(actionRow, marginTopParams(dp(5)));
+
+        moreToolsContent = new LinearLayout(this);
+        moreToolsContent.setOrientation(LinearLayout.VERTICAL);
+        moreToolsContent.setVisibility(moreToolsExpanded ? View.VISIBLE : View.GONE);
+        controlPanelContent.addView(moreToolsContent, marginTopParams(dp(4)));
+
+        moreToolsContent.addView(sectionLabel("绘制与规划"), marginTopParams(dp(3)));
+        LinearLayout planningToolsRow = horizontalRow();
+        roadSnapButton = secondaryButton("道路吸附");
+        waypointOrderButton = secondaryButton("顺序编辑");
+        reverseRouteButton = secondaryButton("反转顺序");
+        roadSnapButton.setOnClickListener(view -> requestHandDrawnRoadRoute(
+                RoadRouteClient.Profile.FOOT,
+                "路线已按步行道路吸附"
+        ));
+        waypointOrderButton.setOnClickListener(view -> showWaypointOrderDialog());
+        reverseRouteButton.setOnClickListener(view -> reverseRouteOrder());
+        addEqualButtons(planningToolsRow, roadSnapButton, waypointOrderButton, reverseRouteButton);
+        moreToolsContent.addView(planningToolsRow, marginTopParams(dp(4)));
+
+        moreToolsContent.addView(sectionLabel("路线管理"), marginTopParams(dp(7)));
+        LinearLayout routeToolsRow = horizontalRow();
+        saveRouteButton = secondaryButton("保存路线");
+        undoButton = secondaryButton("撤销");
+        clearButton = secondaryButton("清空");
+        fitButton = secondaryButton("显示全程");
+        saveRouteButton.setOnClickListener(view -> showSaveRouteDialog());
+        undoButton.setOnClickListener(view -> undoEdit());
+        clearButton.setOnClickListener(view -> clearRoute());
+        fitButton.setOnClickListener(view -> fitRoute());
+        addEqualButtons(routeToolsRow, saveRouteButton, undoButton, clearButton, fitButton);
+        moreToolsContent.addView(routeToolsRow, marginTopParams(dp(4)));
+
+        moreToolsContent.addView(sectionLabel("模拟高级"), marginTopParams(dp(7)));
         LinearLayout variationHeader = horizontalRow();
         variationHeader.addView(textView("自然速度波动", 14, R.color.ink));
         variationHeader.addView(weightedSpace());
         variationValueText = textView("", 14, R.color.primary);
         variationHeader.addView(variationValueText);
-        controlPanelContent.addView(variationHeader);
+        moreToolsContent.addView(variationHeader, marginTopParams(dp(3)));
 
         variationSeekBar = new SeekBar(this);
         variationSeekBar.setMax(14);
@@ -663,7 +759,7 @@ public final class MainActivity extends ComponentActivity {
                 saveSettings();
             }
         });
-        controlPanelContent.addView(variationSeekBar, compactSeekBarParams());
+        moreToolsContent.addView(variationSeekBar, compactSeekBarParams());
 
         healthSyncCheckBox = new CheckBox(this);
         healthSyncCheckBox.setText(R.string.health_sync_label);
@@ -681,27 +777,8 @@ public final class MainActivity extends ComponentActivity {
             }
             enableHealthSync();
         });
-        controlPanelContent.addView(healthSyncCheckBox);
-
-        startButton = new Button(this);
-        startButton.setText("开始模拟");
-        startButton.setTextColor(Color.WHITE);
-        startButton.setTextSize(16);
-        startButton.setAllCaps(false);
-        startButton.setBackgroundResource(R.drawable.bg_button_primary);
-        startButton.setOnClickListener(view -> {
-            if (simulationRunning) {
-                stopSimulation();
-            } else {
-                validateAndStart();
-            }
-        });
-        LinearLayout.LayoutParams startParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(50)
-        );
-        startParams.topMargin = dp(5);
-        controlPanelContent.addView(startButton, startParams);
+        moreToolsContent.addView(healthSyncCheckBox, marginTopParams(dp(2)));
+        updateMoreToolsButton();
         return panel;
     }
 
@@ -715,11 +792,173 @@ public final class MainActivity extends ComponentActivity {
         }
         pushHistory(new ArrayList<>(route));
         RoutePoint routePoint = new RoutePoint(point.getLatitude(), point.getLongitude());
-        waypoints.add(routePoint);
+        waypoints.add(RouteWaypoint.auto(routePoint));
         route.clear();
-        route.addAll(waypoints);
+        route.addAll(waypointPoints());
         onRouteEdited();
         return true;
+    }
+
+    private void moveWaypoint(int fromIndex, int toIndex) {
+        if (simulationRunning
+                || fromIndex < 0
+                || toIndex < 0
+                || fromIndex >= waypoints.size()
+                || toIndex >= waypoints.size()
+                || fromIndex == toIndex) {
+            return;
+        }
+        pushHistory(new ArrayList<>(route));
+        RouteWaypoint moved = waypoints.remove(fromIndex);
+        waypoints.add(toIndex, moved);
+        route.clear();
+        route.addAll(waypointPoints());
+        onRouteEdited();
+        Toast.makeText(this, "已调整途经点顺序", Toast.LENGTH_SHORT).show();
+    }
+
+    private void deleteWaypoint(int index) {
+        if (simulationRunning || index < 0 || index >= waypoints.size()) {
+            return;
+        }
+        pushHistory(new ArrayList<>(route));
+        waypoints.remove(index);
+        route.clear();
+        route.addAll(waypointPoints());
+        onRouteEdited();
+        Toast.makeText(this, "已删除途经点", Toast.LENGTH_SHORT).show();
+    }
+
+    private void showWaypointEditDialog(int index) {
+        if (simulationRunning || index < 0 || index >= waypoints.size()) {
+            return;
+        }
+        RouteWaypoint waypoint = waypoints.get(index);
+        String[] actions = new String[]{
+                "设为道路点（蓝色，允许贴合道路）",
+                "设为强制经过点（橙色，保留原始坐标）",
+                "删除这个途经点"
+        };
+        new AlertDialog.Builder(this)
+                .setTitle("途经点 " + (index + 1))
+                .setMessage("当前：" + waypointTypeLabel(waypoint))
+                .setItems(actions, (dialog, which) -> {
+                    if (which == 0) {
+                        setWaypointType(index, WaypointType.ROAD);
+                    } else if (which == 1) {
+                        setWaypointType(index, WaypointType.FORCED);
+                    } else {
+                        deleteWaypoint(index);
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void setWaypointType(int index, WaypointType type) {
+        if (simulationRunning || index < 0 || index >= waypoints.size()) {
+            return;
+        }
+        RouteWaypoint current = waypoints.get(index);
+        if (current.type() == type && current.isManualType()) {
+            Toast.makeText(this, "途经点类型未变化", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        waypoints.set(index, current.withManualType(type));
+        onRouteEdited();
+        Toast.makeText(
+                this,
+                type == WaypointType.FORCED
+                        ? "已设为强制经过点；下次规划会保留该坐标"
+                        : "已设为道路点；下次规划会优先贴合道路",
+                Toast.LENGTH_SHORT
+        ).show();
+    }
+
+    private void showWaypointOrderDialog() {
+        if (waypoints.size() < 2) {
+            Toast.makeText(this, "请先点选至少两个途经点", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setPadding(dp(8), dp(4), dp(8), dp(8));
+        ScrollView scrollView = new ScrollView(this);
+        scrollView.addView(list);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("编辑途经点顺序")
+                .setMessage("点上的数字就是通过顺序。蓝色为道路点，橙色为强制经过点。")
+                .setView(scrollView)
+                .setNegativeButton("关闭", null)
+                .create();
+
+        for (int i = 0; i < waypoints.size(); i++) {
+            RouteWaypoint waypoint = waypoints.get(i);
+            RoutePoint point = waypoint.point();
+            LinearLayout row = horizontalRow();
+            row.setPadding(0, dp(4), 0, dp(4));
+
+            TextView details = textView(String.format(
+                    Locale.CHINA,
+                    "%02d  %s\n%.5f, %.5f",
+                    i + 1,
+                    waypointTypeLabel(waypoint),
+                    point.latitude(),
+                    point.longitude()
+            ), 13, R.color.ink);
+            row.addView(details, new LinearLayout.LayoutParams(0, dp(54), 1f));
+
+            Button up = secondaryButton("上移");
+            up.setEnabled(i > 0);
+            final int upIndex = i;
+            up.setOnClickListener(view -> {
+                dialog.dismiss();
+                moveWaypoint(upIndex, upIndex - 1);
+                showWaypointOrderDialog();
+            });
+            LinearLayout.LayoutParams upParams = new LinearLayout.LayoutParams(dp(56), dp(38));
+            upParams.leftMargin = dp(6);
+            row.addView(up, upParams);
+
+            Button down = secondaryButton("下移");
+            down.setEnabled(i < waypoints.size() - 1);
+            final int downIndex = i;
+            down.setOnClickListener(view -> {
+                dialog.dismiss();
+                moveWaypoint(downIndex, downIndex + 1);
+                showWaypointOrderDialog();
+            });
+            LinearLayout.LayoutParams downParams = new LinearLayout.LayoutParams(dp(56), dp(38));
+            downParams.leftMargin = dp(6);
+            row.addView(down, downParams);
+
+            list.addView(row);
+        }
+        dialog.show();
+    }
+
+    private String waypointTypeLabel(RouteWaypoint waypoint) {
+        String type = waypoint.type() == WaypointType.FORCED ? "强制经过点" : "道路点";
+        return waypoint.isManualType() ? type + "（手动）" : type + "（自动）";
+    }
+
+    private void reverseRouteOrder() {
+        if (simulationRunning) {
+            return;
+        }
+        if (route.size() < 2) {
+            Toast.makeText(this, "至少需要两个路线点才能反转", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        pushHistory(new ArrayList<>(route));
+        Collections.reverse(route);
+        if (waypoints.size() >= 2) {
+            Collections.reverse(waypoints);
+        }
+        onRouteEdited();
+        Toast.makeText(this, "已对调起点和终点顺序", Toast.LENGTH_SHORT).show();
     }
 
     private void setMode(RouteOverlayView.Mode mode) {
@@ -731,7 +970,7 @@ public final class MainActivity extends ComponentActivity {
         pointButton.setSelected(mode == RouteOverlayView.Mode.POINT);
         drawButton.setSelected(mode == RouteOverlayView.Mode.DRAW);
         if (mode == RouteOverlayView.Mode.POINT) {
-            modeHintText.setText("点按地图添加蓝色途经点，再点“多点规划”");
+            modeHintText.setText("点按添加途经点，拖动调序，长按可改类型或删除");
         } else if (mode == RouteOverlayView.Mode.DRAW) {
             modeHintText.setText("连续手绘大致轨迹，完成后点“道路吸附”");
         } else {
@@ -744,6 +983,7 @@ public final class MainActivity extends ComponentActivity {
         routeStore.saveRoute(route);
         routeStore.saveWaypoints(waypoints);
         routeOverlay.setActivePoint(null);
+        routeOverlay.setFailedRoute(Collections.emptyList());
         routeOverlay.setWaypoints(waypoints);
         routeOverlay.invalidate();
         updateRouteStats();
@@ -761,7 +1001,7 @@ public final class MainActivity extends ComponentActivity {
         if (history.isEmpty()) {
             return;
         }
-        boolean undoingWaypoint = route.equals(waypoints) && !waypoints.isEmpty();
+        boolean undoingWaypoint = route.equals(waypointPoints()) && !waypoints.isEmpty();
         route.clear();
         route.addAll(history.removeLast());
         if (undoingWaypoint) {
@@ -809,7 +1049,7 @@ public final class MainActivity extends ComponentActivity {
                         input.setError("请输入路线名称");
                         return;
                     }
-                    SavedRoute savedRoute = routeStore.saveNamedRoute(name, route);
+                    SavedRoute savedRoute = routeStore.saveNamedRoute(name, route, waypoints);
                     currentSavedRouteName = savedRoute.name();
                     updateEditButtons();
                     Toast.makeText(this, "路线已保存", Toast.LENGTH_SHORT).show();
@@ -847,10 +1087,11 @@ public final class MainActivity extends ComponentActivity {
             );
             TextView details = textView(String.format(
                     Locale.CHINA,
-                    "%s\n%.2f km · %d 点 · %s",
+                    "%s\n%.2f km · %d 点 · %d 途经点 · %s",
                     savedRoute.name(),
                     savedRoute.distanceMeters() / 1000.0,
                     savedRoute.points().size(),
+                    savedRoute.waypoints().size(),
                     ROUTE_DATE_FORMAT.format(updatedAt)
             ), 14, R.color.ink);
             details.setMaxLines(2);
@@ -908,6 +1149,7 @@ public final class MainActivity extends ComponentActivity {
         route.clear();
         route.addAll(savedRoute.points());
         waypoints.clear();
+        waypoints.addAll(savedRoute.waypoints());
         currentSavedRouteName = savedRoute.name();
         routeStore.saveRoute(route);
         routeStore.saveWaypoints(waypoints);
@@ -949,8 +1191,8 @@ public final class MainActivity extends ComponentActivity {
     }
 
     private void planWalkingRoute() {
-        List<RoutePoint> requestedPoints = chooseRoutePlanningPoints();
-        if (requestedPoints.size() < 2) {
+        List<RouteWaypoint> requestedWaypoints = chooseRoutePlanningWaypoints();
+        if (requestedWaypoints.size() < 2) {
             Toast.makeText(
                     this,
                     "请先点选至少两个途经点，或载入一条已有路线",
@@ -959,19 +1201,23 @@ public final class MainActivity extends ComponentActivity {
             return;
         }
         Toast.makeText(this, "开始多点步行规划…", Toast.LENGTH_SHORT).show();
-        requestRoadRoute(
-                requestedPoints,
+        requestWaypointRoadRoute(
+                requestedWaypoints,
                 RoadRouteClient.Profile.FOOT,
                 "已生成步行道路路线"
         );
     }
 
-    private List<RoutePoint> chooseRoutePlanningPoints() {
+    private List<RouteWaypoint> chooseRoutePlanningWaypoints() {
         if (waypoints.size() >= 2) {
             return new ArrayList<>(waypoints);
         }
         if (route.size() >= 2) {
-            return new ArrayList<>(route);
+            List<RouteWaypoint> routeWaypoints = new ArrayList<>(route.size());
+            for (RoutePoint point : route) {
+                routeWaypoints.add(RouteWaypoint.auto(point));
+            }
+            return routeWaypoints;
         }
         return Collections.emptyList();
     }
@@ -986,6 +1232,20 @@ public final class MainActivity extends ComponentActivity {
         }
     }
 
+    private void setMoreToolsExpanded(boolean expanded) {
+        moreToolsExpanded = expanded;
+        if (moreToolsContent != null) {
+            moreToolsContent.setVisibility(expanded ? View.VISIBLE : View.GONE);
+        }
+        updateMoreToolsButton();
+    }
+
+    private void updateMoreToolsButton() {
+        if (moreToolsButton != null) {
+            moreToolsButton.setText(moreToolsExpanded ? "收起工具" : "更多工具");
+        }
+    }
+
     private void requestRoadRoute(
             List<RoutePoint> requestedPoints,
             RoadRouteClient.Profile profile,
@@ -996,9 +1256,11 @@ public final class MainActivity extends ComponentActivity {
             return;
         }
         List<RoutePoint> original = new ArrayList<>(route);
+        List<RoutePoint> requestSnapshot = new ArrayList<>(requestedPoints);
         roadSnapInProgress = true;
         roadSnapButton.setText("规划中…");
         routePlanButton.setText("规划中…");
+        routeOverlay.setFailedRoute(Collections.emptyList());
         setEditorEnabled(false);
         startButton.setEnabled(false);
         routingProgressDialog = new AlertDialog.Builder(this)
@@ -1014,11 +1276,13 @@ public final class MainActivity extends ComponentActivity {
         routingExecutor.execute(() -> {
             try {
                 Log.i(TAG, "road routing request started, profile=" + profile
-                        + ", requestedPoints=" + requestedPoints.size());
-                List<RoutePoint> snapped = roadRouteClient.route(requestedPoints, profile);
+                        + ", requestedPoints=" + requestSnapshot.size());
+                List<RoutePoint> snapped = roadRouteClient.route(requestSnapshot, profile);
                 Log.i(TAG, "road routing request succeeded, resultPoints=" + snapped.size());
                 mainHandler.post(() -> completeRoadRoute(
                         original,
+                        requestSnapshot,
+                        profile,
                         snapped,
                         successMessage,
                         null
@@ -1027,6 +1291,68 @@ public final class MainActivity extends ComponentActivity {
                 Log.e(TAG, "road routing request failed", exception);
                 mainHandler.post(() -> completeRoadRoute(
                         original,
+                        requestSnapshot,
+                        profile,
+                        null,
+                        successMessage,
+                        exception
+                ));
+            }
+        });
+    }
+
+    private void requestWaypointRoadRoute(
+            List<RouteWaypoint> requestedWaypoints,
+            RoadRouteClient.Profile profile,
+            String successMessage
+    ) {
+        if (roadSnapInProgress || simulationRunning) {
+            Toast.makeText(this, "路线正在规划，请稍候", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        List<RoutePoint> original = new ArrayList<>(route);
+        List<RouteWaypoint> requestSnapshot = new ArrayList<>(requestedWaypoints);
+        List<RoutePoint> requestPoints = RouteWaypoint.pointsOf(requestSnapshot);
+        roadSnapInProgress = true;
+        roadSnapButton.setText("规划中…");
+        routePlanButton.setText("规划中…");
+        routeOverlay.setFailedRoute(Collections.emptyList());
+        setEditorEnabled(false);
+        startButton.setEnabled(false);
+        routingProgressDialog = new AlertDialog.Builder(this)
+                .setTitle("正在规划混合路线")
+                .setMessage(
+                        "道路点会贴合步行道路；远离道路的点会作为强制经过点保留。"
+                                + "\n复杂路线可能需要几十秒。"
+                )
+                .setCancelable(false)
+                .create();
+        routingProgressDialog.show();
+
+        routingExecutor.execute(() -> {
+            try {
+                Log.i(TAG, "hybrid routing request started, profile=" + profile
+                        + ", requestedWaypoints=" + requestSnapshot.size());
+                RoadRouteClient.HybridRouteResult result = roadRouteClient.routeWaypoints(
+                        requestSnapshot,
+                        profile
+                );
+                Log.i(TAG, "hybrid routing request succeeded, resultPoints="
+                        + result.route().size());
+                mainHandler.post(() -> completeWaypointRoadRoute(
+                        original,
+                        requestSnapshot,
+                        profile,
+                        result,
+                        successMessage,
+                        null
+                ));
+            } catch (Exception exception) {
+                Log.e(TAG, "hybrid routing request failed", exception);
+                mainHandler.post(() -> completeWaypointRoadRoute(
+                        original,
+                        requestSnapshot,
+                        profile,
                         null,
                         successMessage,
                         exception
@@ -1037,6 +1363,8 @@ public final class MainActivity extends ComponentActivity {
 
     private void completeRoadRoute(
             List<RoutePoint> original,
+            List<RoutePoint> requestedPoints,
+            RoadRouteClient.Profile profile,
             List<RoutePoint> snapped,
             String successMessage,
             Exception error
@@ -1055,16 +1383,8 @@ public final class MainActivity extends ComponentActivity {
         setEditorEnabled(!simulationRunning);
 
         if (error != null || snapped == null) {
-            String detail = error == null ? "" : error.getMessage();
-            new AlertDialog.Builder(this)
-                    .setTitle("道路规划失败")
-                    .setMessage(
-                            detail == null || detail.isEmpty()
-                                    ? "没有收到道路路线，请检查网络后重试。"
-                                    : detail
-                    )
-                    .setPositiveButton("知道了", null)
-                    .show();
+            routeOverlay.setFailedRoute(requestedPoints);
+            showRoadRouteFailureDialog(original, requestedPoints, profile, successMessage, error);
             return;
         }
 
@@ -1081,22 +1401,153 @@ public final class MainActivity extends ComponentActivity {
         ).show();
     }
 
+    private void completeWaypointRoadRoute(
+            List<RoutePoint> original,
+            List<RouteWaypoint> requestedWaypoints,
+            RoadRouteClient.Profile profile,
+            RoadRouteClient.HybridRouteResult result,
+            String successMessage,
+            Exception error
+    ) {
+        if (isDestroyed()) {
+            return;
+        }
+        roadSnapInProgress = false;
+        if (routingProgressDialog != null) {
+            routingProgressDialog.dismiss();
+            routingProgressDialog = null;
+        }
+        roadSnapButton.setText("道路吸附");
+        routePlanButton.setText("多点规划");
+        startButton.setEnabled(true);
+        setEditorEnabled(!simulationRunning);
+
+        List<RoutePoint> requestPoints = RouteWaypoint.pointsOf(requestedWaypoints);
+        if (error != null || result == null) {
+            routeOverlay.setFailedRoute(requestPoints);
+            showWaypointRouteFailureDialog(
+                    original,
+                    requestedWaypoints,
+                    profile,
+                    successMessage,
+                    error
+            );
+            return;
+        }
+
+        pushHistory(original);
+        route.clear();
+        route.addAll(result.route());
+        waypoints.clear();
+        waypoints.addAll(result.waypoints());
+        onRouteEdited();
+        setMode(RouteOverlayView.Mode.BROWSE);
+        mapView.post(this::fitRoute);
+        Toast.makeText(
+                this,
+                successMessage + "，强制经过点已保留，可使用撤销恢复",
+                Toast.LENGTH_SHORT
+        ).show();
+    }
+
+    private void showRoadRouteFailureDialog(
+            List<RoutePoint> original,
+            List<RoutePoint> requestedPoints,
+            RoadRouteClient.Profile profile,
+            String successMessage,
+            Exception error
+    ) {
+        String detail = error == null ? "" : error.getMessage();
+        String message = detail == null || detail.isEmpty()
+                ? "没有收到道路路线，请检查网络后重试。"
+                : detail;
+        new AlertDialog.Builder(this)
+                .setTitle("道路规划失败")
+                .setMessage(message + "\n\n红色线段已标出本次失败的规划范围。")
+                .setPositiveButton("重新规划", (dialog, which) -> requestRoadRoute(
+                        new ArrayList<>(requestedPoints),
+                        profile,
+                        successMessage
+                ))
+                .setNegativeButton("保留原路线", (dialog, which) -> {
+                    routeOverlay.setFailedRoute(Collections.emptyList());
+                    Toast.makeText(this, "已保留当前路线", Toast.LENGTH_SHORT).show();
+                })
+                .setNeutralButton("撤销规划", (dialog, which) -> restoreRouteAfterFailedPlanning(original))
+                .show();
+    }
+
+    private void showWaypointRouteFailureDialog(
+            List<RoutePoint> original,
+            List<RouteWaypoint> requestedWaypoints,
+            RoadRouteClient.Profile profile,
+            String successMessage,
+            Exception error
+    ) {
+        String detail = error == null ? "" : error.getMessage();
+        String message = detail == null || detail.isEmpty()
+                ? "没有收到混合路线，请检查网络后重试。"
+                : detail;
+        new AlertDialog.Builder(this)
+                .setTitle("混合路线规划失败")
+                .setMessage(message + "\n\n红色线段已标出本次失败的规划范围。")
+                .setPositiveButton("重新规划", (dialog, which) -> requestWaypointRoadRoute(
+                        new ArrayList<>(requestedWaypoints),
+                        profile,
+                        successMessage
+                ))
+                .setNegativeButton("保留原路线", (dialog, which) -> {
+                    routeOverlay.setFailedRoute(Collections.emptyList());
+                    Toast.makeText(this, "已保留当前路线", Toast.LENGTH_SHORT).show();
+                })
+                .setNeutralButton("撤销规划", (dialog, which) -> restoreRouteAfterFailedPlanning(original))
+                .show();
+    }
+
+    private void restoreRouteAfterFailedPlanning(List<RoutePoint> original) {
+        route.clear();
+        route.addAll(original);
+        if (!waypoints.isEmpty() && !route.equals(waypointPoints())) {
+            waypoints.clear();
+        }
+        routeStore.saveRoute(route);
+        routeStore.saveWaypoints(waypoints);
+        routeOverlay.setActivePoint(null);
+        routeOverlay.setFailedRoute(Collections.emptyList());
+        routeOverlay.setWaypoints(waypoints);
+        routeOverlay.invalidate();
+        updateRouteStats();
+        updateEditButtons();
+        Toast.makeText(this, "已撤销本次规划，恢复原路线", Toast.LENGTH_SHORT).show();
+    }
+
     @SuppressLint("MissingPermission")
     private void centerOnCurrentLocation() {
+        requestCurrentLocation(false);
+    }
+
+    @SuppressLint("MissingPermission")
+    private void setCurrentLocationAsRouteStart() {
+        requestCurrentLocation(true);
+    }
+
+    @SuppressLint("MissingPermission")
+    private void requestCurrentLocation(boolean useAsRouteStart) {
         if (simulationRunning) {
             Toast.makeText(this, "请先停止模拟，再获取真实当前位置", Toast.LENGTH_SHORT).show();
             return;
         }
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
                 != PackageManager.PERMISSION_GRANTED) {
-            pendingLocateAfterPermission = true;
+            pendingLocateAfterPermission = !useAsRouteStart;
+            pendingSetStartAfterPermission = useAsRouteStart;
             requestPermissions(
                     new String[]{Manifest.permission.ACCESS_FINE_LOCATION},
                     REQUEST_LOCATION_PERMISSIONS
             );
             return;
         }
-        if (!mapReady || map == null) {
+        if (!useAsRouteStart && (!mapReady || map == null)) {
             ensureMapIsUsable();
             Toast.makeText(this, "地图正在加载，请稍候再试", Toast.LENGTH_SHORT).show();
             return;
@@ -1116,7 +1567,8 @@ public final class MainActivity extends ComponentActivity {
         Location lastKnown = findBestLastKnownLocation(manager);
         if (lastKnown != null
                 && System.currentTimeMillis() - lastKnown.getTime() <= 120_000L) {
-            showLocationOnMap(lastKnown);
+            locationRequestForStartPoint = useAsRouteStart;
+            handleLocationResult(lastKnown, false);
             return;
         }
 
@@ -1130,6 +1582,7 @@ public final class MainActivity extends ComponentActivity {
         }
 
         locationFallback = lastKnown;
+        locationRequestForStartPoint = useAsRouteStart;
         locationRequestInProgress = true;
         mainHandler.postDelayed(locationTimeoutRunnable, LOCATION_TIMEOUT_MILLIS);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -1174,13 +1627,65 @@ public final class MainActivity extends ComponentActivity {
         cancelLocationRequest();
         locationFallback = null;
         if (location != null && !location.isFromMockProvider()) {
-            showLocationOnMap(location);
+            handleLocationResult(location, false);
         } else if (fallback != null) {
-            showLocationOnMap(fallback);
+            handleLocationResult(fallback, true);
             Toast.makeText(this, "已定位到系统记录的最近位置", Toast.LENGTH_SHORT).show();
         } else {
             Toast.makeText(this, "未能获取当前位置", Toast.LENGTH_SHORT).show();
         }
+    }
+
+    private void handleLocationResult(Location location, boolean fromFallback) {
+        if (locationRequestForStartPoint) {
+            addLocationAsRouteStart(location, fromFallback);
+        } else {
+            showLocationOnMap(location);
+        }
+        locationRequestForStartPoint = false;
+    }
+
+    private void addLocationAsRouteStart(Location location, boolean fromFallback) {
+        RoutePoint start = new RoutePoint(location.getLatitude(), location.getLongitude());
+        pushHistory(new ArrayList<>(route));
+        if (!waypoints.isEmpty()) {
+            if (!samePlace(start, waypoints.get(0).point())) {
+                waypoints.add(0, RouteWaypoint.auto(start));
+            } else {
+                waypoints.set(0, waypoints.get(0).withPoint(start));
+            }
+            route.clear();
+            route.addAll(waypointPoints());
+        } else if (!route.isEmpty()) {
+            if (!samePlace(start, route.get(0))) {
+                route.add(0, start);
+            } else {
+                route.set(0, start);
+            }
+        } else {
+            waypoints.add(RouteWaypoint.auto(start));
+            route.add(start);
+            setMode(RouteOverlayView.Mode.POINT);
+        }
+        onRouteEdited();
+        if (mapReady && map != null) {
+            map.animateCamera(
+                    CameraUpdateFactory.newLatLngZoom(
+                            new LatLng(start.latitude(), start.longitude()),
+                            17.0
+                    ),
+                    650
+            );
+        }
+        Toast.makeText(
+                this,
+                fromFallback ? "已用最近位置设为起点" : "已将当前位置设为起点",
+                Toast.LENGTH_SHORT
+        ).show();
+    }
+
+    private boolean samePlace(RoutePoint a, RoutePoint b) {
+        return GeoMath.distanceMeters(a, b) < 2.0;
     }
 
     private void showLocationOnMap(Location location) {
@@ -1314,10 +1819,16 @@ public final class MainActivity extends ComponentActivity {
         routeLibraryButton.setEnabled(enabled);
         roadSnapButton.setEnabled(enabled && !roadSnapInProgress);
         routePlanButton.setEnabled(enabled && !roadSnapInProgress);
+        waypointOrderButton.setEnabled(enabled && waypoints.size() >= 2);
+        currentStartButton.setEnabled(enabled);
+        reverseRouteButton.setEnabled(enabled && route.size() >= 2);
         roundTripCheckBox.setEnabled(enabled);
         speedSeekBar.setEnabled(enabled);
         variationSeekBar.setEnabled(enabled);
         healthSyncCheckBox.setEnabled(enabled && isHealthSyncAvailable());
+        if (moreToolsButton != null) {
+            moreToolsButton.setEnabled(enabled);
+        }
     }
 
     private void updateEditButtons() {
@@ -1328,12 +1839,20 @@ public final class MainActivity extends ComponentActivity {
         routeLibraryButton.setEnabled(!simulationRunning);
         roadSnapButton.setEnabled(!simulationRunning && !roadSnapInProgress);
         routePlanButton.setEnabled(!simulationRunning && !roadSnapInProgress);
+        waypointOrderButton.setEnabled(!simulationRunning && waypoints.size() >= 2);
+        currentStartButton.setEnabled(!simulationRunning);
+        reverseRouteButton.setEnabled(!simulationRunning && route.size() >= 2);
         roundTripCheckBox.setEnabled(!simulationRunning);
+        startButton.setEnabled(simulationRunning || (!roadSnapInProgress && route.size() >= 2));
+        moreToolsButton.setEnabled(!simulationRunning);
         routeLibraryButton.setText(String.format(
                 Locale.CHINA,
                 "路线库 (%d)",
                 routeStore.loadSavedRoutes().size()
         ));
+        routePlanButton.setText(roadSnapInProgress ? "规划中…" : "多点规划");
+        roadSnapButton.setText(roadSnapInProgress ? "规划中…" : "道路吸附");
+        updateMoreToolsButton();
     }
 
     private void updateRouteStats() {
@@ -1355,7 +1874,36 @@ public final class MainActivity extends ComponentActivity {
                 minutes,
                 estimatedSteps
         ));
+        updateRouteStateText(meters);
         updateEditButtons();
+    }
+
+    private void updateRouteStateText(double metersForStats) {
+        if (routeStateText == null) {
+            return;
+        }
+        String message;
+        boolean warning = false;
+        if (simulationRunning) {
+            message = "当前状态：正在模拟。下一步：可从主按钮停止，或收起面板查看地图。";
+        } else if (roadSnapInProgress) {
+            message = "当前状态：正在规划路线。下一步：等待结果，失败时可重新规划/保留/撤销。";
+        } else if (route.isEmpty()) {
+            message = "当前状态：空路线。下一步：定位设起点并点选、手绘路线，或从路线库载入。";
+            warning = true;
+        } else if (route.size() == 1 || metersForStats < 1.0) {
+            message = "当前状态：路线过短。下一步：继续点选或手绘补足至少两个有效点。";
+            warning = true;
+        } else if (!waypoints.isEmpty()) {
+            message = "当前状态：混合路线。下一步：长按途经点改类型，或多点规划后开始模拟。";
+        } else {
+            message = "当前状态：已有路线。下一步：开始模拟、重新规划，或保存到路线库。";
+        }
+        routeStateText.setText(message);
+        routeStateText.setBackgroundResource(warning
+                ? R.drawable.bg_status_warn
+                : R.drawable.bg_status_ok);
+        routeStateText.setPadding(dp(10), dp(7), dp(10), dp(7));
     }
 
     private List<RoutePoint> routeForStats() {
@@ -1363,6 +1911,10 @@ public final class MainActivity extends ComponentActivity {
             return buildRoundTripRoute(route);
         }
         return route;
+    }
+
+    private List<RoutePoint> waypointPoints() {
+        return RouteWaypoint.pointsOf(waypoints);
     }
 
     private static List<RoutePoint> buildRoundTripRoute(List<RoutePoint> oneWayRoute) {
@@ -1550,7 +2102,7 @@ public final class MainActivity extends ComponentActivity {
     private Button secondaryButton(String text) {
         Button button = new Button(this);
         button.setText(text);
-        button.setTextSize(13);
+        button.setTextSize(12);
         button.setTextColor(getColor(R.color.ink));
         button.setAllCaps(false);
         button.setMinHeight(0);
@@ -1560,6 +2112,12 @@ public final class MainActivity extends ComponentActivity {
         button.setPadding(dp(8), 0, dp(8), 0);
         button.setBackgroundResource(R.drawable.bg_button_secondary);
         return button;
+    }
+
+    private TextView sectionLabel(String text) {
+        TextView label = textView(text, 13, R.color.muted);
+        label.setTypeface(label.getTypeface(), android.graphics.Typeface.BOLD);
+        return label;
     }
 
     private LinearLayout horizontalRow() {
@@ -1573,11 +2131,11 @@ public final class MainActivity extends ComponentActivity {
         for (int i = 0; i < buttons.length; i++) {
             LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                     0,
-                    dp(42),
+                    dp(38),
                     1f
             );
             if (i > 0) {
-                params.leftMargin = dp(7);
+                params.leftMargin = dp(6);
             }
             row.addView(buttons[i], params);
         }
@@ -1601,7 +2159,7 @@ public final class MainActivity extends ComponentActivity {
     private LinearLayout.LayoutParams compactSeekBarParams() {
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(34)
+                dp(30)
         );
         params.leftMargin = -dp(8);
         params.rightMargin = -dp(8);
@@ -1650,6 +2208,31 @@ public final class MainActivity extends ComponentActivity {
 
     private int dp(float value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private static final class LimitedHeightScrollView extends ScrollView {
+        private final float maxHeightFraction;
+
+        LimitedHeightScrollView(Context context, float maxHeightFraction) {
+            super(context);
+            this.maxHeightFraction = maxHeightFraction;
+        }
+
+        @Override
+        protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+            int screenHeight = getResources().getDisplayMetrics().heightPixels;
+            int maxHeight = Math.round(screenHeight * maxHeightFraction);
+            int heightMode = MeasureSpec.getMode(heightMeasureSpec);
+            int heightSize = MeasureSpec.getSize(heightMeasureSpec);
+            int cappedHeight = heightMode == MeasureSpec.UNSPECIFIED
+                    ? maxHeight
+                    : Math.min(heightSize, maxHeight);
+            int cappedHeightSpec = MeasureSpec.makeMeasureSpec(
+                    cappedHeight,
+                    MeasureSpec.AT_MOST
+            );
+            super.onMeasure(widthMeasureSpec, cappedHeightSpec);
+        }
     }
 
     private abstract static class SimpleSeekListener

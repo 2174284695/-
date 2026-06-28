@@ -24,6 +24,8 @@ import com.example.routesimulator.data.RouteStore;
 import com.example.routesimulator.model.GeoMath;
 import com.example.routesimulator.model.RoutePoint;
 import com.example.routesimulator.model.RouteSample;
+import com.example.routesimulator.model.RouteSegmentClassifier;
+import com.example.routesimulator.model.RouteWaypoint;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -59,6 +61,7 @@ public final class SimulationService extends Service {
     private MockLocationController mockLocationController;
     private List<RoutePoint> route;
     private List<Double> cumulativeDistances;
+    private boolean[] offRoadSegments;
     private HumanSpeedModel speedModel;
     private SimulatedStepModel stepModel;
     private HealthConnectStepWriter healthConnectStepWriter;
@@ -116,6 +119,7 @@ public final class SimulationService extends Service {
         }
 
         route = routeStore.loadRoute();
+        List<RouteWaypoint> waypoints = routeStore.loadWaypoints();
         if (route.size() < 2) {
             broadcastState(false, null, 0f, "路线至少需要两个点");
             stopSelf();
@@ -128,6 +132,10 @@ public final class SimulationService extends Service {
         float speedKmh = routeStore.loadSpeedKmh();
         int variationPercent = routeStore.loadVariationPercent();
         cumulativeDistances = GeoMath.cumulativeDistances(route);
+        offRoadSegments = RouteSegmentClassifier.offRoadSegmentsForForcedWaypoints(
+                route,
+                waypoints
+        );
         totalDistanceMeters = cumulativeDistances.get(cumulativeDistances.size() - 1);
         if (totalDistanceMeters < 1.0) {
             broadcastState(false, null, 0f, "路线过短");
@@ -184,7 +192,10 @@ public final class SimulationService extends Service {
         double deltaSeconds = Math.max(0.05, (now - lastTickElapsed) / 1000.0);
         lastTickElapsed = now;
 
-        double speedMetersPerSecond = speedModel.nextSpeed(deltaSeconds);
+        double speedMetersPerSecond = speedModel.nextSpeed(
+                deltaSeconds,
+                routeSpeedFactor(progressMeters)
+        );
         double previousProgress = progressMeters;
         progressMeters = Math.min(
                 totalDistanceMeters,
@@ -225,6 +236,84 @@ public final class SimulationService extends Service {
             roundTrip.add(oneWayRoute.get(i));
         }
         return roundTrip;
+    }
+
+    private double routeSpeedFactor(double currentProgressMeters) {
+        if (route == null || route.size() < 2 || totalDistanceMeters <= 0.0) {
+            return 1.0;
+        }
+
+        double factor = turnSpeedFactor(currentProgressMeters)
+                * RouteSegmentClassifier.speedFactorForProgress(
+                currentProgressMeters,
+                cumulativeDistances,
+                offRoadSegments == null ? new boolean[0] : offRoadSegments
+        );
+        double startRamp = rampFactor(currentProgressMeters, 4.0, 22.0, 0.48, 1.0);
+        double remainingMeters = totalDistanceMeters - currentProgressMeters;
+        double arrivalRamp = rampFactor(remainingMeters, 4.0, 28.0, 0.42, 1.0);
+        return clamp(factor * Math.min(startRamp, arrivalRamp), 0.38, 1.10);
+    }
+
+    private double turnSpeedFactor(double currentProgressMeters) {
+        if (totalDistanceMeters < 18.0) {
+            return 1.0;
+        }
+        double lookDistance = Math.min(18.0, Math.max(8.0, totalDistanceMeters * 0.02));
+        RouteSample before = GeoMath.sampleAtDistance(
+                route,
+                cumulativeDistances,
+                Math.max(0.0, currentProgressMeters - lookDistance)
+        );
+        RouteSample after = GeoMath.sampleAtDistance(
+                route,
+                cumulativeDistances,
+                Math.min(totalDistanceMeters, currentProgressMeters + lookDistance)
+        );
+        double turnDegrees = bearingDeltaDegrees(
+                before.bearingDegrees(),
+                after.bearingDegrees()
+        );
+        if (turnDegrees >= 70.0) {
+            return 0.62;
+        }
+        if (turnDegrees >= 45.0) {
+            return 0.76;
+        }
+        if (turnDegrees >= 25.0) {
+            return 0.88;
+        }
+        if (turnDegrees <= 8.0) {
+            return 1.04;
+        }
+        return 1.0;
+    }
+
+    private static double rampFactor(
+            double distanceMeters,
+            double minimumDistance,
+            double fullSpeedDistance,
+            double minimumFactor,
+            double maximumFactor
+    ) {
+        if (distanceMeters <= minimumDistance) {
+            return minimumFactor;
+        }
+        if (distanceMeters >= fullSpeedDistance) {
+            return maximumFactor;
+        }
+        double fraction = (distanceMeters - minimumDistance)
+                / (fullSpeedDistance - minimumDistance);
+        return minimumFactor + (maximumFactor - minimumFactor) * fraction;
+    }
+
+    private static double bearingDeltaDegrees(double first, double second) {
+        double delta = Math.abs((first - second + 540.0) % 360.0 - 180.0);
+        return Math.min(180.0, delta);
+    }
+
+    private static double clamp(double value, double minimum, double maximum) {
+        return Math.max(minimum, Math.min(maximum, value));
     }
 
     private void stopSimulation(String message) {

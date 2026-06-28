@@ -3,18 +3,23 @@ package com.example.routesimulator.ui;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.DashPathEffect;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PointF;
+import android.graphics.Typeface;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.AttributeSet;
 import android.view.MotionEvent;
 import android.view.View;
 
-import com.example.routesimulator.model.GeoMath;
+import com.example.routesimulator.model.RouteDraftMerger;
 import com.example.routesimulator.model.RoutePoint;
+import com.example.routesimulator.model.RouteSegmentClassifier;
+import com.example.routesimulator.model.RouteWaypoint;
 import com.example.routesimulator.model.RouteSimplifier;
+import com.example.routesimulator.model.WaypointType;
 
 import org.maplibre.android.geometry.LatLng;
 import org.maplibre.android.maps.MapLibreMap;
@@ -38,24 +43,29 @@ public final class RouteOverlayView extends View {
         void onWaypointMoved(int fromIndex, int toIndex);
 
         void onWaypointDeleted(int index);
+
+        void onWaypointLongPressed(int index);
     }
 
     private final Paint routeOutlinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint routePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint offRoadSegmentPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint draftPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint failurePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint markerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint markerOutlinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint activePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint waypointPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint forcedWaypointPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint waypointOutlinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint waypointDragPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint waypointNumberPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final List<PointF> draftPoints = new ArrayList<>();
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     private MapLibreMap map;
     private List<RoutePoint> route = Collections.emptyList();
-    private List<RoutePoint> waypoints = Collections.emptyList();
+    private List<RouteWaypoint> waypoints = Collections.emptyList();
     private List<RoutePoint> failedRoute = Collections.emptyList();
     private Mode mode = Mode.BROWSE;
     private RoutePoint activePoint;
@@ -75,7 +85,7 @@ public final class RouteOverlayView extends View {
                 && !draggingWaypoint
                 && waypointEditListener != null) {
             longPressHandled = true;
-            waypointEditListener.onWaypointDeleted(pressedWaypointIndex);
+            waypointEditListener.onWaypointLongPressed(pressedWaypointIndex);
             pressedWaypointIndex = -1;
             performClick();
         }
@@ -103,6 +113,17 @@ public final class RouteOverlayView extends View {
         routePaint.setStrokeCap(Paint.Cap.ROUND);
         routePaint.setStrokeJoin(Paint.Join.ROUND);
 
+        offRoadSegmentPaint.setColor(Color.rgb(255, 138, 0));
+        offRoadSegmentPaint.setAlpha(235);
+        offRoadSegmentPaint.setStrokeWidth(dp(7));
+        offRoadSegmentPaint.setStyle(Paint.Style.STROKE);
+        offRoadSegmentPaint.setStrokeCap(Paint.Cap.ROUND);
+        offRoadSegmentPaint.setStrokeJoin(Paint.Join.ROUND);
+        offRoadSegmentPaint.setPathEffect(new DashPathEffect(
+                new float[]{dp(10), dp(7)},
+                0f
+        ));
+
         draftPaint.setColor(Color.rgb(28, 146, 97));
         draftPaint.setAlpha(210);
         draftPaint.setStrokeWidth(dp(5));
@@ -127,11 +148,16 @@ public final class RouteOverlayView extends View {
         activePaint.setStyle(Paint.Style.FILL);
         waypointPaint.setColor(Color.rgb(31, 92, 190));
         waypointPaint.setStyle(Paint.Style.FILL);
+        forcedWaypointPaint.setColor(Color.rgb(255, 138, 0));
+        forcedWaypointPaint.setStyle(Paint.Style.FILL);
         waypointOutlinePaint.setColor(Color.WHITE);
         waypointOutlinePaint.setStrokeWidth(dp(3));
         waypointOutlinePaint.setStyle(Paint.Style.STROKE);
         waypointDragPaint.setColor(Color.rgb(255, 138, 0));
         waypointDragPaint.setStyle(Paint.Style.FILL);
+        waypointNumberPaint.setColor(Color.WHITE);
+        waypointNumberPaint.setTextAlign(Paint.Align.CENTER);
+        waypointNumberPaint.setTypeface(Typeface.DEFAULT_BOLD);
         setMode(Mode.BROWSE);
     }
 
@@ -147,7 +173,7 @@ public final class RouteOverlayView extends View {
         invalidate();
     }
 
-    public void setWaypoints(List<RoutePoint> waypoints) {
+    public void setWaypoints(List<RouteWaypoint> waypoints) {
         this.waypoints = waypoints;
         invalidate();
     }
@@ -257,6 +283,7 @@ public final class RouteOverlayView extends View {
         if (route.size() > 1) {
             canvas.drawPath(path, routeOutlinePaint);
             canvas.drawPath(path, routePaint);
+            drawOffRoadSegments(canvas);
         }
 
         PointF start = toScreenPoint(route.get(0));
@@ -295,6 +322,24 @@ public final class RouteOverlayView extends View {
         canvas.drawPath(path, failurePaint);
     }
 
+    private void drawOffRoadSegments(Canvas canvas) {
+        boolean[] offRoadSegments = RouteSegmentClassifier.offRoadSegmentsForForcedWaypoints(
+                route,
+                waypoints
+        );
+        for (int i = 0; i < offRoadSegments.length; i++) {
+            if (!offRoadSegments[i]) {
+                continue;
+            }
+            PointF start = toScreenPoint(route.get(i));
+            PointF end = toScreenPoint(route.get(i + 1));
+            Path path = new Path();
+            path.moveTo(start.x, start.y);
+            path.lineTo(end.x, end.y);
+            canvas.drawPath(path, offRoadSegmentPaint);
+        }
+    }
+
     private void drawActivePoint(Canvas canvas) {
         if (activePoint == null) {
             return;
@@ -306,15 +351,24 @@ public final class RouteOverlayView extends View {
 
     private void drawWaypoints(Canvas canvas) {
         for (int i = 0; i < waypoints.size(); i++) {
-            RoutePoint waypoint = waypoints.get(i);
-            PointF point = toScreenPoint(waypoint);
-            canvas.drawCircle(point.x, point.y, dp(9), waypointOutlinePaint);
+            RouteWaypoint waypoint = waypoints.get(i);
+            PointF point = toScreenPoint(waypoint.point());
+            float radius = i == draggingWaypointIndex ? dp(10) : dp(9);
+            canvas.drawCircle(point.x, point.y, radius + dp(3), waypointOutlinePaint);
+            Paint fillPaint = waypoint.type() == WaypointType.FORCED
+                    ? forcedWaypointPaint
+                    : waypointPaint;
             canvas.drawCircle(
                     point.x,
                     point.y,
-                    i == draggingWaypointIndex ? dp(7) : dp(6),
-                    i == draggingWaypointIndex ? waypointDragPaint : waypointPaint
+                    radius,
+                    i == draggingWaypointIndex ? waypointDragPaint : fillPaint
             );
+            String number = String.valueOf(i + 1);
+            waypointNumberPaint.setTextSize(number.length() >= 2 ? dp(9) : dp(11));
+            Paint.FontMetrics metrics = waypointNumberPaint.getFontMetrics();
+            float baseline = point.y - (metrics.ascent + metrics.descent) / 2f;
+            canvas.drawText(number, point.x, baseline, waypointNumberPaint);
         }
     }
 
@@ -402,7 +456,7 @@ public final class RouteOverlayView extends View {
         int bestIndex = -1;
         double bestDistance = Double.MAX_VALUE;
         for (int i = 0; i < waypoints.size(); i++) {
-            PointF point = toScreenPoint(waypoints.get(i));
+            PointF point = toScreenPoint(waypoints.get(i).point());
             double distance = Math.hypot(point.x - x, point.y - y);
             if (distance <= radius && distance < bestDistance) {
                 bestIndex = i;
@@ -419,7 +473,7 @@ public final class RouteOverlayView extends View {
         int bestIndex = 0;
         double bestDistance = Double.MAX_VALUE;
         for (int i = 0; i < waypoints.size(); i++) {
-            PointF point = toScreenPoint(waypoints.get(i));
+            PointF point = toScreenPoint(waypoints.get(i).point());
             double distance = Math.hypot(point.x - x, point.y - y);
             if (distance < bestDistance) {
                 bestIndex = i;
@@ -452,14 +506,8 @@ public final class RouteOverlayView extends View {
         }
         List<RoutePoint> simplified = RouteSimplifier.simplify(rawStroke, 2.5);
 
-        if (!route.isEmpty() && !simplified.isEmpty()
-                && GeoMath.distanceMeters(
-                route.get(route.size() - 1),
-                simplified.get(0)
-        ) < 1.0) {
-            simplified.remove(0);
-        }
-        route.addAll(simplified);
+        route.clear();
+        route.addAll(RouteDraftMerger.merge(previousRoute, simplified, 1.0));
         draftPoints.clear();
         if (routeChangedListener != null) {
             routeChangedListener.onRouteChanged(previousRoute);

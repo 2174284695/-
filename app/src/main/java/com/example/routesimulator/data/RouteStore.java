@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.SharedPreferences;
 
 import com.example.routesimulator.model.RoutePoint;
+import com.example.routesimulator.model.RouteWaypoint;
 import com.example.routesimulator.model.SavedRoute;
 
 import org.json.JSONArray;
@@ -39,12 +40,30 @@ public final class RouteStore {
         return loadPoints(KEY_ROUTE);
     }
 
-    public void saveWaypoints(List<RoutePoint> points) {
-        savePoints(KEY_WAYPOINTS, points);
+    public void saveWaypoints(List<RouteWaypoint> waypoints) {
+        JSONArray array = new JSONArray();
+        for (RouteWaypoint waypoint : waypoints) {
+            try {
+                array.put(waypoint.toJson());
+            } catch (JSONException ignored) {
+                // Latitude, longitude, and waypoint type are generated locally.
+            }
+        }
+        preferences.edit().putString(KEY_WAYPOINTS, array.toString()).apply();
     }
 
-    public List<RoutePoint> loadWaypoints() {
-        return loadPoints(KEY_WAYPOINTS);
+    public List<RouteWaypoint> loadWaypoints() {
+        List<RouteWaypoint> waypoints = new ArrayList<>();
+        String encoded = preferences.getString(KEY_WAYPOINTS, "[]");
+        try {
+            JSONArray array = new JSONArray(encoded);
+            for (int i = 0; i < array.length(); i++) {
+                waypoints.add(RouteWaypoint.fromJson(array.getJSONObject(i)));
+            }
+        } catch (JSONException | IllegalArgumentException ignored) {
+            preferences.edit().remove(KEY_WAYPOINTS).apply();
+        }
+        return waypoints;
     }
 
     private void savePoints(String key, List<RoutePoint> points) {
@@ -112,7 +131,11 @@ public final class RouteStore {
         return preferences.getBoolean(KEY_ROUND_TRIP, false);
     }
 
-    public SavedRoute saveNamedRoute(String requestedName, List<RoutePoint> points) {
+    public SavedRoute saveNamedRoute(
+            String requestedName,
+            List<RoutePoint> points,
+            List<RouteWaypoint> waypoints
+    ) {
         String name = requestedName.trim();
         if (name.isEmpty()) {
             throw new IllegalArgumentException("Route name cannot be empty");
@@ -135,11 +158,16 @@ public final class RouteStore {
                 id,
                 name,
                 System.currentTimeMillis(),
-                points
+                points,
+                waypoints
         );
         routes.add(savedRoute);
         writeSavedRoutes(routes);
         return savedRoute;
+    }
+
+    public SavedRoute saveNamedRoute(String requestedName, List<RoutePoint> points) {
+        return saveNamedRoute(requestedName, points, new ArrayList<>());
     }
 
     public List<SavedRoute> loadSavedRoutes() {

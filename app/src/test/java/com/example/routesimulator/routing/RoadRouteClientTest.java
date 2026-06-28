@@ -1,6 +1,8 @@
 package com.example.routesimulator.routing;
 
 import com.example.routesimulator.model.RoutePoint;
+import com.example.routesimulator.model.RouteWaypoint;
+import com.example.routesimulator.model.WaypointType;
 
 import org.junit.Test;
 
@@ -8,6 +10,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 public final class RoadRouteClientTest {
@@ -57,6 +60,125 @@ public final class RoadRouteClientTest {
             assertEquals(expected.get(i).latitude(), decoded.get(i).latitude(), 0.000001);
             assertEquals(expected.get(i).longitude(), decoded.get(i).longitude(), 0.000001);
         }
+    }
+
+    @Test
+    public void buildHybridRouteAutoOffRoadWaypointBecomesForcedAndInserted() {
+        RoutePoint offRoad = new RoutePoint(31.230500, 121.474200);
+        List<RoutePoint> roadRoute = List.of(
+                new RoutePoint(31.230000, 121.473700),
+                new RoutePoint(31.230500, 121.473700),
+                new RoutePoint(31.231000, 121.473700)
+        );
+        List<RouteWaypoint> requested = List.of(
+                RouteWaypoint.auto(roadRoute.get(0)),
+                RouteWaypoint.auto(offRoad),
+                RouteWaypoint.auto(roadRoute.get(2))
+        );
+
+        RoadRouteClient.HybridRouteResult result = RoadRouteClient.buildHybridRoute(
+                roadRoute,
+                requested
+        );
+
+        assertTrue(result.route().contains(offRoad));
+        assertEquals(4, result.route().size());
+        assertEquals(WaypointType.FORCED, result.waypoints().get(1).type());
+        assertFalse(result.waypoints().get(1).isManualType());
+    }
+
+    @Test
+    public void buildHybridRouteUsesSegmentDistanceForAutoRoadWaypoint() {
+        RoutePoint nearRoad = new RoutePoint(31.230500, 121.473705);
+        List<RoutePoint> roadRoute = List.of(
+                new RoutePoint(31.230000, 121.473700),
+                new RoutePoint(31.231000, 121.473700)
+        );
+        List<RouteWaypoint> requested = List.of(
+                RouteWaypoint.auto(roadRoute.get(0)),
+                RouteWaypoint.auto(nearRoad),
+                RouteWaypoint.auto(roadRoute.get(1))
+        );
+
+        RoadRouteClient.HybridRouteResult result = RoadRouteClient.buildHybridRoute(
+                roadRoute,
+                requested
+        );
+
+        assertEquals(roadRoute, result.route());
+        assertEquals(WaypointType.ROAD, result.waypoints().get(1).type());
+    }
+
+    @Test
+    public void buildHybridRouteManualRoadWaypointDoesNotInsertOffRoadPoint() {
+        RoutePoint offRoad = new RoutePoint(31.230500, 121.474200);
+        List<RoutePoint> roadRoute = List.of(
+                new RoutePoint(31.230000, 121.473700),
+                new RoutePoint(31.230500, 121.473700),
+                new RoutePoint(31.231000, 121.473700)
+        );
+        List<RouteWaypoint> requested = List.of(
+                RouteWaypoint.auto(roadRoute.get(0)),
+                RouteWaypoint.road(offRoad),
+                RouteWaypoint.auto(roadRoute.get(2))
+        );
+
+        RoadRouteClient.HybridRouteResult result = RoadRouteClient.buildHybridRoute(
+                roadRoute,
+                requested
+        );
+
+        assertEquals(roadRoute, result.route());
+        assertEquals(WaypointType.ROAD, result.waypoints().get(1).type());
+        assertTrue(result.waypoints().get(1).isManualType());
+    }
+
+    @Test
+    public void buildHybridRouteManualForcedWaypointIsInsertedWhenNearRoad() {
+        RoutePoint nearRoad = new RoutePoint(31.230500, 121.473750);
+        List<RoutePoint> roadRoute = List.of(
+                new RoutePoint(31.230000, 121.473700),
+                new RoutePoint(31.231000, 121.473700)
+        );
+        List<RouteWaypoint> requested = List.of(
+                RouteWaypoint.auto(roadRoute.get(0)),
+                RouteWaypoint.forced(nearRoad),
+                RouteWaypoint.auto(roadRoute.get(1))
+        );
+
+        RoadRouteClient.HybridRouteResult result = RoadRouteClient.buildHybridRoute(
+                roadRoute,
+                requested
+        );
+
+        assertTrue(result.route().contains(nearRoad));
+        assertEquals(WaypointType.FORCED, result.waypoints().get(1).type());
+        assertTrue(result.waypoints().get(1).isManualType());
+    }
+
+    @Test
+    public void buildHybridRouteCanRestoreOffRoadEndpoints() {
+        RoutePoint start = new RoutePoint(31.229800, 121.473300);
+        RoutePoint end = new RoutePoint(31.231200, 121.474100);
+        List<RoutePoint> roadRoute = List.of(
+                new RoutePoint(31.230000, 121.473700),
+                new RoutePoint(31.230500, 121.473700),
+                new RoutePoint(31.231000, 121.473700)
+        );
+        List<RouteWaypoint> requested = List.of(
+                RouteWaypoint.auto(start),
+                RouteWaypoint.auto(end)
+        );
+
+        RoadRouteClient.HybridRouteResult result = RoadRouteClient.buildHybridRoute(
+                roadRoute,
+                requested
+        );
+
+        assertEquals(start, result.route().get(0));
+        assertEquals(end, result.route().get(result.route().size() - 1));
+        assertEquals(WaypointType.FORCED, result.waypoints().get(0).type());
+        assertEquals(WaypointType.FORCED, result.waypoints().get(1).type());
     }
 
     private static String encodePolyline6(List<RoutePoint> points) {
